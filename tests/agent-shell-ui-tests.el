@@ -337,6 +337,19 @@ straight into the next block's leading spaces."
   (mapcar (lambda (c) (map-elt c :qualified-id))
           (agent-shell-ui--group-children :group-qualified-id group-qualified-id)))
 
+(defun agent-shell-ui-tests--group-hidden-p (group-qualified-id)
+  "Return non-nil when every char in GROUP-QUALIFIED-ID's child region is hidden."
+  (when-let* ((region (agent-shell-ui--group-child-region
+                       :group-qualified-id group-qualified-id)))
+    (let ((position (map-elt region :start))
+          (hidden t))
+      (while (and hidden (< position (map-elt region :end)))
+        (setq hidden (eq (get-text-property position 'invisible) t)
+              position (or (next-single-property-change
+                            position 'invisible nil (map-elt region :end))
+                           (map-elt region :end))))
+      hidden)))
+
 (ert-deftest agent-shell-ui-group-auto-creates-header-and-nests-members-test ()
   "A member with a `:group-id' auto-creates the header and nests under it."
   (with-temp-buffer
@@ -547,12 +560,14 @@ member stays in its original group."
       (should (equal '("ns-m1" "ns-m2")
                      (mapcar (lambda (c) (map-elt c :qualified-id)) kids)))
       (dolist (c kids)
-        (should (get-text-property (map-elt c :start) 'invisible))))))
+        (should (get-text-property (map-elt c :start) 'invisible)))
+      (should (agent-shell-ui-tests--group-hidden-p "ns-grp")))))
 
 (ert-deftest agent-shell-ui-group-collapsed-member-update-stays-hidden-test ()
-  "Updating a member in a collapsed group keeps it hidden (no leak).
+  "Updating a member stays hidden without searching or refolding its group.
 Regression: a member's in-place edit restored its own visibility while the
-separators stayed hidden, collapsing members onto the folded header line."
+separators stayed hidden, collapsing members onto the folded header line.
+Refolding repaired the leak but enumerated every sibling on every update."
   (with-temp-buffer
     (agent-shell-ui-mode 1)
     ;; Group created collapsed; two labels-only members.
@@ -563,17 +578,117 @@ separators stayed hidden, collapsing members onto the folded header line."
         :group-expanded nil :label-left "… run" :label-right m)
        :navigation 'always))
     ;; Update m1 with a body (as a completion would).
-    (agent-shell-ui-update-fragment
-     (agent-shell-ui-make-fragment-model
-      :namespace-id "ns" :block-id "m1" :group-id "grp" :group-label "T"
-      :group-expanded nil :label-left "✓ run" :label-right "m1" :body "output")
-     :navigation 'always)
+    (let ((calls 0)
+          (header-function (symbol-function 'agent-shell-ui--group-header-range))
+          (children-function (symbol-function 'agent-shell-ui--group-children))
+          (region-function (symbol-function 'agent-shell-ui--group-child-region))
+          (collapse-function (symbol-function 'agent-shell-ui--set-group-collapsed)))
+      (cl-letf (((symbol-function 'agent-shell-ui--group-header-range)
+                 (lambda (&rest args)
+                   (setq calls (1+ calls))
+                   (apply header-function args)))
+                ((symbol-function 'agent-shell-ui--group-children)
+                 (lambda (&rest args)
+                   (setq calls (1+ calls))
+                   (apply children-function args)))
+                ((symbol-function 'agent-shell-ui--group-child-region)
+                 (lambda (&rest args)
+                   (setq calls (1+ calls))
+                   (apply region-function args)))
+                ((symbol-function 'agent-shell-ui--set-group-collapsed)
+                 (lambda (&rest args)
+                   (setq calls (1+ calls))
+                   (apply collapse-function args))))
+        (agent-shell-ui-update-fragment
+         (agent-shell-ui-make-fragment-model
+          :namespace-id "ns" :block-id "m1" :group-id "grp" :group-label "T"
+          :group-expanded nil :label-left "✓ run" :label-right "m1" :body "output")
+         :navigation 'always))
+      (should (= calls 0)))
     ;; Every member, including the just-updated one, stays hidden.
     (dolist (c (agent-shell-ui--group-children :group-qualified-id "ns-grp"))
       (should (get-text-property (map-elt c :start) 'invisible))
       ;; A position strictly inside the block is hidden too (not just the
       ;; leading char), so member content can't leak onto the header line.
-      (should (get-text-property (1+ (map-elt c :start)) 'invisible)))))
+      (should (get-text-property (1+ (map-elt c :start)) 'invisible)))
+    (should (agent-shell-ui-tests--group-hidden-p "ns-grp"))))
+
+(ert-deftest agent-shell-ui-group-collapsed-no-op-update-does-not-traverse-group-test ()
+  "An unchanged member update does not search or traverse its parent group."
+  (with-temp-buffer
+    (agent-shell-ui-mode 1)
+    (dolist (id '("m1" "m2"))
+      (agent-shell-ui-update-fragment
+       (agent-shell-ui-make-fragment-model
+        :namespace-id "ns" :block-id id :group-id "grp" :group-label "T"
+        :group-expanded nil :label-left "run" :label-right id)
+       :navigation 'always))
+    (let ((calls 0)
+          (header-function (symbol-function 'agent-shell-ui--group-header-range))
+          (children-function (symbol-function 'agent-shell-ui--group-children))
+          (region-function (symbol-function 'agent-shell-ui--group-child-region))
+          (collapse-function (symbol-function 'agent-shell-ui--set-group-collapsed)))
+      (cl-letf (((symbol-function 'agent-shell-ui--group-header-range)
+                 (lambda (&rest args)
+                   (setq calls (1+ calls))
+                   (apply header-function args)))
+                ((symbol-function 'agent-shell-ui--group-children)
+                 (lambda (&rest args)
+                   (setq calls (1+ calls))
+                   (apply children-function args)))
+                ((symbol-function 'agent-shell-ui--group-child-region)
+                 (lambda (&rest args)
+                   (setq calls (1+ calls))
+                   (apply region-function args)))
+                ((symbol-function 'agent-shell-ui--set-group-collapsed)
+                 (lambda (&rest args)
+                   (setq calls (1+ calls))
+                   (apply collapse-function args))))
+        (agent-shell-ui-update-fragment
+         (agent-shell-ui-make-fragment-model
+          :namespace-id "ns" :block-id "m2" :group-id "grp" :group-label "T"
+          :group-expanded nil :label-left "run" :label-right "m2")
+         :navigation 'always))
+      (should (= calls 0)))))
+
+(ert-deftest agent-shell-ui-group-collapsed-in-place-updates-stay-hidden-test ()
+  "In-place label and body updates preserve a collapsed parent group."
+  (with-temp-buffer
+    (agent-shell-ui-mode 1)
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "member" :group-id "grp" :group-label "T"
+      :label-left "run" :label-right "member" :body "first")
+     :expanded t :navigation 'always)
+    (agent-shell-ui-set-group-collapsed-by-id
+     :namespace-id "ns" :block-id "grp" :collapsed t :no-undo t)
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "member" :group-id "grp" :group-label "T"
+      :label-left "completed")
+     :navigation 'always)
+    (should (agent-shell-ui-tests--group-hidden-p "ns-grp"))
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "member" :group-id "grp" :group-label "T"
+      :body " second")
+     :append t :navigation 'always)
+    (should (agent-shell-ui-tests--group-hidden-p "ns-grp"))
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "member" :group-id "grp" :group-label "T"
+      :body "replacement")
+     :navigation 'always)
+    (should (agent-shell-ui-tests--group-hidden-p "ns-grp"))
+    (agent-shell-ui-set-group-collapsed-by-id
+     :namespace-id "ns" :block-id "grp" :collapsed nil :no-undo t)
+    (let* ((member (car (agent-shell-ui--group-children
+                         :group-qualified-id "ns-grp")))
+           (body (agent-shell-ui--nearest-range-matching-property
+                  :property 'agent-shell-ui-section :value 'body
+                  :from (map-elt member :start) :to (map-elt member :end))))
+      (should-not (get-text-property (map-elt member :start) 'invisible))
+      (should-not (get-text-property (map-elt body :start) 'invisible)))))
 
 (ert-deftest agent-shell-ui-group-navigation-skips-collapsed-members-test ()
   "Forward navigation steps into visible members but skips folded ones."
@@ -871,6 +986,25 @@ otherwise signal."
     (goto-char (point-max))
     (should (eq #'newline (key-binding (kbd "RET"))))
     (should (eq #'self-insert-command (key-binding [?x])))))
+
+(ert-deftest agent-shell-ui-label-update-preserves-caller-invisibility-test ()
+  "Updating a visible label preserves caller-supplied invisibility."
+  (with-temp-buffer
+    (agent-shell-ui-mode 1)
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "1" :label-left "old")
+     :navigation 'always)
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "1"
+      :label-left (propertize "new" 'invisible 'custom-hidden))
+     :navigation 'always)
+    (let ((label (agent-shell-ui--nearest-range-matching-property
+                  :property 'agent-shell-ui-section :value 'label-left
+                  :from (point-min) :to (point-max))))
+      (should (eq (get-text-property (map-elt label :start) 'invisible)
+                  'custom-hidden)))))
 
 ;;; provide
 

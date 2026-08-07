@@ -180,6 +180,8 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                  (padding-start nil)
                  (padding-end nil)
                  (group-header nil)
+                 (group-collapsed nil)
+                 (group-collapse-needs-restoring nil)
                  (match (save-mark-and-excursion
                           (goto-char (point-max))
                           (text-property-search-backward
@@ -200,7 +202,13 @@ O(accumulated-body).  Label-only updates leave the body untouched."
               (when-let* ((state (get-text-property (prop-match-beginning match)
                                                     'agent-shell-ui-state))
                           (existing-group (map-elt state :group-id)))
-                (setq model (append model
+                ;; A leaf's own fold never hides its block start, so this
+                ;; position records whether its parent group is collapsed.
+                (setq group-collapsed
+                      (eq (get-text-property (prop-match-beginning match)
+                                             'invisible)
+                          t)
+                      model (append model
                                     (list (cons :group-qualified-id existing-group)
                                           (cons :group-indent
                                                 (or (map-elt state :group-indent) "  ")))))))
@@ -211,7 +219,8 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                                   :group-label (map-elt model :group-label)
                                   :expanded (map-elt model :group-expanded)
                                   :navigation navigation))
-              (setq model (append model
+              (setq group-collapsed (map-elt group-header :collapsed)
+                    model (append model
                                   (list (cons :group-qualified-id (map-elt group-header :qualified-id))
                                         (cons :group-indent "  "))))))
             (when (or new-label-left new-label-right new-body)
@@ -228,10 +237,10 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                     (setq padding-start (point)))
                   (when new-label-left
                     (agent-shell-ui--replace-label
-                     qualified-id 'label-left new-label-left))
+                     qualified-id 'label-left new-label-left group-collapsed))
                   (when new-label-right
                     (agent-shell-ui--replace-label
-                     qualified-id 'label-right new-label-right))
+                     qualified-id 'label-right new-label-right group-collapsed))
                   ;; Derive the block extent here, after the label
                   ;; replacements.  `agent-shell-ui--replace-label' can change
                   ;; a label's length, which shifts everything below it — an
@@ -295,7 +304,8 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                           (delete-region block-start current-block-end)
                           (goto-char block-start)
                           (agent-shell-ui--insert-fragment
-                           final-model qualified-id (not collapsed) navigation))))))
+                           final-model qualified-id (not collapsed) navigation)
+                          (setq group-collapse-needs-restoring group-collapsed))))))
                   (setq padding-end (or (marker-position block-end) (point)))))
                ;; New group member, inserted into the group's region.  The
                ;; group's trailing separator (after the header) already sits
@@ -307,6 +317,8 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                 (agent-shell-ui--insert-read-only (agent-shell-ui--required-newlines 2))
                 (setq block-start (point))
                 (agent-shell-ui--insert-fragment model qualified-id effective-expanded navigation)
+                (setq block-end (copy-marker (point) t)
+                      group-collapse-needs-restoring group-collapsed)
                 ;; The group's trailing separator (the header's `\n\n', inserted
                 ;; once) now sits right after this last member; fold it into
                 ;; this member's padding so it is not stranded outside every
@@ -322,17 +334,11 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                 (agent-shell-ui--insert-fragment model qualified-id effective-expanded navigation)
                 (agent-shell-ui--insert-read-only "\n\n")
                 (setq padding-end (point)))))
-            ;; A collapsed group's members must stay hidden across updates.
-            ;; A member's own edit path (insert, or replace-label/body on an
-            ;; update) restores visibility from the member's own state, which
-            ;; would reveal it under a folded header; re-apply the group
-            ;; collapse so updates don't leak members onto the header line.
-            (when-let* ((group-qid (map-elt model :group-qualified-id))
-                        (header (agent-shell-ui--group-header-range group-qid))
-                        (header-state (get-text-property (map-elt header :start)
-                                                         'agent-shell-ui-state))
-                        ((map-elt header-state :collapsed)))
-              (agent-shell-ui--set-group-collapsed group-qid t))
+            ;; Whole-fragment insertion derives visibility from the member's
+            ;; own state, so restore the parent collapse over this member only.
+            (when (and group-collapse-needs-restoring padding-start block-end)
+              (put-text-property padding-start (marker-position block-end)
+                                 'invisible t))
             (when on-post-process
               (funcall on-post-process))
             (when-let* ((block-range (if block-end
@@ -539,13 +545,14 @@ uniform on both."
                                        (length text))))))
              (>= position end)))))
 
-(defun agent-shell-ui--replace-label (qualified-id section new-text)
+(defun agent-shell-ui--replace-label (qualified-id section new-text &optional group-collapsed)
   "Replace the SECTION region of fragment QUALIFIED-ID with NEW-TEXT.
 
 SECTION is one of `label-left' or `label-right'.  Only the named label
 region is rewritten — the other label, the indicator, and the body of
 the same block stay untouched, so block tagging and fragment identity
-are preserved across label updates."
+are preserved across label updates.  GROUP-COLLAPSED keeps the
+replacement hidden under a collapsed parent group."
   (when (stringp new-text)
     (when-let* ((block-match
                  (save-excursion
@@ -588,7 +595,10 @@ are preserved across label updates."
                                                           front-sticky (read-only)))
             (when state
               (put-text-property insert-start insert-end
-                                 'agent-shell-ui-state state))))))))
+                                 'agent-shell-ui-state state))
+            (when group-collapsed
+              (put-text-property insert-start insert-end
+                                 'invisible t))))))))
 
 
 (cl-defun agent-shell-ui-delete-fragment (&key namespace-id block-id no-undo)
@@ -734,24 +744,32 @@ After the current last member, or just after the header when empty."
   "Insert a header for NAMESPACE-ID/GROUP-ID unless one already exists.
 When created, it lands at `point-max' with GROUP-LABEL as its label,
 EXPANDED as its initial fold state, and NAVIGATION for navigability.
-Return an alist with `:qualified-id' and, only when this call created
-the header, `:range' as (:start . :end) spanning the inserted header
-plus its surrounding padding."
-  (let ((group-qualified-id (format "%s-%s" namespace-id group-id))
-        (range nil))
-    (unless (agent-shell-ui--group-header-range group-qualified-id)
+Return an alist with `:qualified-id' and `:collapsed'.  Only when this
+call created the header, `:range' is (:start . :end) spanning the
+inserted header plus its surrounding padding."
+  (let* ((group-qualified-id (format "%s-%s" namespace-id group-id))
+         (header (agent-shell-ui--group-header-range group-qualified-id))
+         (range nil))
+    (unless header
       (goto-char (point-max))
       (let ((start (point)))
         (agent-shell-ui--insert-read-only (agent-shell-ui--required-newlines 2))
-        (agent-shell-ui--insert-fragment
-         (agent-shell-ui-make-group-model
-          :namespace-id namespace-id :block-id group-id
-          :label-left group-label :expanded expanded)
-         group-qualified-id expanded navigation)
+        (let ((header-start (point)))
+          (agent-shell-ui--insert-fragment
+           (agent-shell-ui-make-group-model
+            :namespace-id namespace-id :block-id group-id
+            :label-left group-label :expanded expanded)
+           group-qualified-id expanded navigation)
+          (setq header (agent-shell-ui--block-range :position header-start)))
         (agent-shell-ui--insert-read-only "\n\n")
         (setq range (list (cons :start start)
                           (cons :end (point))))))
     (list (cons :qualified-id group-qualified-id)
+          (cons :collapsed
+                (and (map-elt (get-text-property (map-elt header :start)
+                                                 'agent-shell-ui-state)
+                              :collapsed)
+                     t))
           (cons :range range))))
 
 (defun agent-shell-ui--labels-end (block)
